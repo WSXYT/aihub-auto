@@ -74,123 +74,161 @@ export const UpdateMirrorSchema = z
 const ProxyUrlSchema = z
 	.string()
 	.url()
-	.refine(
-		(value) => {
-			try {
-				const protocol = new URL(value).protocol;
-				return protocol === "http:" || protocol === "https:";
-			} catch {
-				return false;
-			}
-		},
-		"自定义代理必须是 HTTP(S) URL",
-	);
+	.refine((value) => {
+		try {
+			const protocol = new URL(value).protocol;
+			return protocol === "http:" || protocol === "https:";
+		} catch {
+			return false;
+		}
+	}, "自定义代理必须是 HTTP(S) URL");
+
+const SourceGroupPolicySchema = z
+	.object({
+		/** 来源组未配置时回退全局 mode。 */
+		mode: z.enum(["economy", "balanced", "speed"]).optional(),
+		/** 来源组未配置的边界回退全局 priceBand。 */
+		priceBand: z
+			.object({
+				min: z.number().min(0).optional(),
+				max: z.number().min(0).optional(),
+			})
+			.optional(),
+	})
+	.superRefine((policy, ctx) => {
+		const { min, max } = policy.priceBand ?? {};
+		if (min !== undefined && max !== undefined && min > max) {
+			ctx.addIssue({
+				code: z.ZodIssueCode.custom,
+				path: ["priceBand"],
+				message: "来源组倍率区间 min 不能大于 max",
+			});
+		}
+	});
 
 export const ConfigSchema = z
 	.object({
-	/** AIHub 站点(sub2api),usage-stats 为 aihub 自有接口 */
-	baseUrl: z.string().url().default("https://aihub.top"),
-	/** 可信反向代理对外 origin;空字符串表示不接受跨 origin 控制台请求。 */
-	publicOrigin: PublicOriginSchema.default(""),
-	/** Sentry 公共 DSN;留空时后端 SDK 与网页反馈均不加载。 */
-	sentryDsn: SentryDsnSchema.default(
-		"https://b8e9b3b5f1d86b44f01dae7fe83cfcce@o4510289605296128.ingest.de.sentry.io/4511828894548048",
-	),
-	/** 桌面更新: GitHub 失败后依次尝试的 HTTPS latest.json 镜像。 */
-	updateMirrors: z.array(UpdateMirrorSchema).max(3).default([]),
-	/** 出站代理: none 直连,system 使用进程继承的 HTTP(S)_PROXY,custom 使用下方地址。 */
-	outboundProxyMode: z.enum(["none", "system", "custom"]).default("none"),
-	outboundProxyUrl: z.union([z.literal(""), ProxyUrlSchema]).default(""),
-	/** 模型代理请求的 User-Agent;空字符串表示沿用客户端值。 */
-	upstreamUserAgent: z
-		.string()
-		.max(256)
-		.refine(
-			(value) => /^[\x20-\x7e]*$/.test(value),
-			"User-Agent 只能包含可打印 ASCII 字符",
-		)
-		.default(""),
-	listen: z
-		.object({
-			host: z.string().default("127.0.0.1"),
-			port: z.number().int().min(0).max(65535).default(8787),
-		})
-		.prefault({}),
-	mode: z.enum(["economy", "balanced", "speed"]).default("balanced"),
-	priceBand: z
-		.object({
-			min: z.number().min(0).default(DEFAULT_PRICE_BAND.min),
-			max: z.number().min(0).default(DEFAULT_PRICE_BAND.max),
-		})
-		.prefault({}),
-	blacklist: z.array(z.number().int()).default([]),
-	economyPolicy: z
-		.object({
-			minOutcomeSamples: z
-				.number()
-				.int()
-				.min(1)
-				.max(100)
-				.default(DEFAULT_ECONOMY_POLICY.minOutcomeSamples),
-			minSuccessRate: z
-				.number()
-				.min(0)
-				.max(1)
-				.default(DEFAULT_ECONOMY_POLICY.minSuccessRate),
-			maxConservativeLatencyMs: z
-				.number()
-				.int()
-				.min(1_000)
-				.max(120_000)
-				.default(DEFAULT_ECONOMY_POLICY.maxConservativeLatencyMs),
-		})
-		.prefault({}),
-	/** pool 为主模式;single 仅兼容无法创建 Key 的账号 */
-	keyMode: z.enum(["single", "pool"]).default("pool"),
-	/** 兼容模式:指定要被全局切组的 keyId;缺省自动选第一个 */
-	singleKeyId: z.number().int().optional(),
-	poolMaxGroups: z.number().int().min(1).max(20).default(4),
-	/** 会话映射保留 24h;池 Key 仅按 cacheIdleMs 短期保护。 */
-	sessionTtlMs: z
-		.number()
-		.int()
-		.min(60_000)
-		.default(24 * 60 * 60_000),
-	sessionMaxEntries: z.number().int().min(100).max(100_000).default(10_000),
-	cleanupPoolOnExit: z.boolean().default(false),
-	pollIntervalMs: z.number().int().min(5_000).default(60_000),
-	samples: z.number().int().min(1).max(500).default(100),
-	errorRateCap: z.number().min(0).max(1).default(DEFAULT_ERROR_RATE_CAP),
-	decision: z
-		.object({
-			stickiness: z.number().min(0).default(DEFAULT_DECISION_POLICY.stickiness),
-			cachePenaltyMax: z
-				.number()
-				.min(0)
-				.default(DEFAULT_DECISION_POLICY.cachePenaltyMax),
-			cacheIdleMs: z
-				.number()
-				.int()
-				.min(0)
-				.default(DEFAULT_DECISION_POLICY.cacheIdleMs),
-			minDwellMs: z
-				.number()
-				.int()
-				.min(0)
-				.default(DEFAULT_DECISION_POLICY.minDwellMs),
-		})
-		.prefault({}),
-	/** TTFB 超时(故障转移判定) */
-	ttfbTimeoutMs: z.number().int().min(1_000).default(60_000),
-	/** 非 loopback 监听时必须:反代 /v1 的 Bearer 口令 */
-	proxyToken: z.string().min(16).optional(),
-	/** 非 loopback 监听时必须:/ctl 控制台口令 */
-	uiPassword: z.string().min(12).optional(),
-	/** JSONL 审计日志 */
-	auditLog: z.boolean().default(false),
-	logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
+		/** AIHub 站点(sub2api),usage-stats 为 aihub 自有接口 */
+		baseUrl: z.string().url().default("https://aihub.top"),
+		/** 可信反向代理对外 origin;空字符串表示不接受跨 origin 控制台请求。 */
+		publicOrigin: PublicOriginSchema.default(""),
+		/** Sentry 公共 DSN;留空时后端 SDK 与网页反馈均不加载。 */
+		sentryDsn: SentryDsnSchema.default(
+			"https://b8e9b3b5f1d86b44f01dae7fe83cfcce@o4510289605296128.ingest.de.sentry.io/4511828894548048",
+		),
+		/** 桌面更新: GitHub 失败后依次尝试的 HTTPS latest.json 镜像。 */
+		updateMirrors: z.array(UpdateMirrorSchema).max(3).default([]),
+		/** 出站代理: none 直连,system 使用进程继承的 HTTP(S)_PROXY,custom 使用下方地址。 */
+		outboundProxyMode: z.enum(["none", "system", "custom"]).default("none"),
+		outboundProxyUrl: z.union([z.literal(""), ProxyUrlSchema]).default(""),
+		/** 模型代理请求的 User-Agent;空字符串表示沿用客户端值。 */
+		upstreamUserAgent: z
+			.string()
+			.max(256)
+			.refine(
+				(value) => /^[\x20-\x7e]*$/.test(value),
+				"User-Agent 只能包含可打印 ASCII 字符",
+			)
+			.default(""),
+		listen: z
+			.object({
+				host: z.string().default("127.0.0.1"),
+				port: z.number().int().min(0).max(65535).default(8787),
+			})
+			.prefault({}),
+		mode: z.enum(["economy", "balanced", "speed"]).default("balanced"),
+		priceBand: z
+			.object({
+				min: z.number().min(0).default(DEFAULT_PRICE_BAND.min),
+				max: z.number().min(0).default(DEFAULT_PRICE_BAND.max),
+			})
+			.prefault({}),
+		/** sub2api 来源组策略;缺省时所有请求保持原全局策略。 */
+		groups: z
+			.record(z.string().min(1).max(128), SourceGroupPolicySchema)
+			.default({}),
+		blacklist: z.array(z.number().int()).default([]),
+		economyPolicy: z
+			.object({
+				minOutcomeSamples: z
+					.number()
+					.int()
+					.min(1)
+					.max(100)
+					.default(DEFAULT_ECONOMY_POLICY.minOutcomeSamples),
+				minSuccessRate: z
+					.number()
+					.min(0)
+					.max(1)
+					.default(DEFAULT_ECONOMY_POLICY.minSuccessRate),
+				maxConservativeLatencyMs: z
+					.number()
+					.int()
+					.min(1_000)
+					.max(120_000)
+					.default(DEFAULT_ECONOMY_POLICY.maxConservativeLatencyMs),
+			})
+			.prefault({}),
+		/** pool 为主模式;single 仅兼容无法创建 Key 的账号 */
+		keyMode: z.enum(["single", "pool"]).default("pool"),
+		/** 兼容模式:指定要被全局切组的 keyId;缺省自动选第一个 */
+		singleKeyId: z.number().int().optional(),
+		poolMaxGroups: z.number().int().min(1).max(20).default(4),
+		/** 会话映射保留 24h;池 Key 仅按 cacheIdleMs 短期保护。 */
+		sessionTtlMs: z
+			.number()
+			.int()
+			.min(60_000)
+			.default(24 * 60 * 60_000),
+		sessionMaxEntries: z.number().int().min(100).max(100_000).default(10_000),
+		cleanupPoolOnExit: z.boolean().default(false),
+		pollIntervalMs: z.number().int().min(5_000).default(60_000),
+		samples: z.number().int().min(1).max(500).default(100),
+		errorRateCap: z.number().min(0).max(1).default(DEFAULT_ERROR_RATE_CAP),
+		decision: z
+			.object({
+				stickiness: z
+					.number()
+					.min(0)
+					.default(DEFAULT_DECISION_POLICY.stickiness),
+				cachePenaltyMax: z
+					.number()
+					.min(0)
+					.default(DEFAULT_DECISION_POLICY.cachePenaltyMax),
+				cacheIdleMs: z
+					.number()
+					.int()
+					.min(0)
+					.default(DEFAULT_DECISION_POLICY.cacheIdleMs),
+				minDwellMs: z
+					.number()
+					.int()
+					.min(0)
+					.default(DEFAULT_DECISION_POLICY.minDwellMs),
+			})
+			.prefault({}),
+		/** TTFB 超时(故障转移判定) */
+		ttfbTimeoutMs: z.number().int().min(1_000).default(60_000),
+		/** 非 loopback 监听时必须:反代 /v1 的 Bearer 口令 */
+		proxyToken: z.string().min(16).optional(),
+		/** 非 loopback 监听时必须:/ctl 控制台口令 */
+		uiPassword: z.string().min(12).optional(),
+		/** JSONL 审计日志 */
+		auditLog: z.boolean().default(false),
+		logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
 	})
 	.superRefine((config, ctx) => {
+		for (const [name, policy] of Object.entries(config.groups)) {
+			const min = policy.priceBand?.min ?? config.priceBand.min;
+			const max = policy.priceBand?.max ?? config.priceBand.max;
+			if (min > max) {
+				ctx.addIssue({
+					code: z.ZodIssueCode.custom,
+					path: ["groups", name, "priceBand"],
+					message: "来源组倍率区间 min 不能大于 max",
+				});
+			}
+		}
 		if (config.outboundProxyMode === "custom" && !config.outboundProxyUrl) {
 			ctx.addIssue({
 				code: z.ZodIssueCode.custom,

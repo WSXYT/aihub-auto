@@ -1,4 +1,8 @@
-import { AIHubApiError, type AIHubClient, type ExcludeReason } from "@aihub-auto/core";
+import {
+	AIHubApiError,
+	type AIHubClient,
+	type ExcludeReason,
+} from "@aihub-auto/core";
 import { join } from "node:path";
 import type { AppConfig, AppState, Credentials, FileStore } from "./config.ts";
 import { ConfigSchema } from "./config.ts";
@@ -172,8 +176,13 @@ export async function handleControl(
 		});
 	}
 
+	if (path === "/ctl/group-prices" && req.method === "GET") {
+		return json(await deps.daemon.lowestPrices());
+	}
+
 	if (path === "/ctl/account" && req.method === "GET") {
-		if (!deps.credentials.accessToken) return json({ email: null, balance: null });
+		if (!deps.credentials.accessToken)
+			return json({ email: null, balance: null });
 		try {
 			const profile = await deps.client.me();
 			return json({
@@ -337,6 +346,9 @@ export async function handleControl(
 			"invalid_latency",
 			"local_error_rate",
 		]);
+		if (Object.keys(deps.config.groups).length > 0) {
+			forceReclaimReasons.delete("price_band");
+		}
 		const groups = [...groupIds]
 			.sort((left, right) => left - right)
 			.map((groupId) => {
@@ -405,6 +417,7 @@ export async function handleControl(
 				keyMode: deps.config.keyMode,
 				poolMaxGroups: deps.config.poolMaxGroups,
 				priceBand: deps.config.priceBand,
+				groups: deps.config.groups,
 				economyPolicy: deps.config.economyPolicy,
 				upstreamUserAgent: deps.config.upstreamUserAgent,
 				updateMirrors: deps.config.updateMirrors,
@@ -529,6 +542,7 @@ export async function handleControl(
 		const allowed = [
 			"mode",
 			"priceBand",
+			"groups",
 			"economyPolicy",
 			"upstreamUserAgent",
 			"updateMirrors",

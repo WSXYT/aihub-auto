@@ -114,6 +114,7 @@ const HOP_BY_HOP = new Set([
 	"content-length",
 	"authorization",
 	"x-api-key",
+	"x-sub2api-group",
 	LOCAL_RESPONSE_HEADER,
 ]);
 
@@ -410,9 +411,19 @@ async function handleProxyRequest(
 		}
 	}
 
-	const context = requestRoutingContext(path, req.headers, body, (responseId) =>
-		deps.affinity.resolveResponse(responseId),
-	);
+	const sourceGroup = req.headers.get("x-sub2api-group")?.trim() || undefined;
+	const responseAlias = (responseId: string) =>
+		sourceGroup ? `${sourceGroup}:${responseId}` : responseId;
+	const context: RouteRequest = {
+		...requestRoutingContext(
+			path,
+			req.headers,
+			body,
+			(responseId) => deps.affinity.resolveResponse(responseAlias(responseId)),
+			sourceGroup,
+		),
+		sourceGroup,
+	};
 	let active: ActiveKey | undefined;
 	try {
 		active = await deps.route(context);
@@ -682,7 +693,11 @@ async function handleProxyRequest(
 					);
 					const responseId = findResponseId(responseProbe);
 					if (responseId) {
-						deps.affinity.bindResponse(responseId, context.sessionKey, groupId);
+						deps.affinity.bindResponse(
+							responseAlias(responseId),
+							context.sessionKey,
+							groupId,
+						);
 						responseIdBound = true;
 					}
 				}

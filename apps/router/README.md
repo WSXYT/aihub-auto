@@ -77,6 +77,8 @@ AIHUB_AUTO_PORT=9000 ./aihub-auto
 | `listen.host` / `listen.port` | `127.0.0.1` / `8787` | 监听地址,可改 `0.0.0.0` |
 | `mode` | `balanced` | economy / balanced / speed |
 | `priceBand.min/max` | 0 / 0.15 | 倍率硬约束 |
+| `groups.<来源名>.mode` | 回退 `mode` | sub2api 来源组专用 economy / balanced / speed 策略 |
+| `groups.<来源名>.priceBand.min/max` | 回退全局 `priceBand` | sub2api 来源组专用倍率边界 |
 | `economyPolicy.minSuccessRate` | 0.8 | 省钱模式最低 3 小时成功率 |
 | `economyPolicy.minOutcomeSamples` | 3 | 启用成功率门槛前的最少结果数 |
 | `economyPolicy.maxConservativeLatencyMs` | 20000 | 省钱模式最大保守 TTFT |
@@ -90,6 +92,34 @@ AIHUB_AUTO_PORT=9000 ./aihub-auto
 | `decision.*` | 见 ALGORITHM.md | 粘性/缓存惩罚/空闲阈值/最短驻留 |
 | `auditLog` | false | JSONL 决策审计(含每轮全部候选得分) |
 | `logLevel` | `info` | `app.log` 最低日志级别:debug / info / warn / error |
+
+## sub2api 多来源接口
+
+`X-Sub2api-Group` 请求头选择来源组策略；缺少该头或名称未配置时，仍使用全局 `mode` 与 `priceBand`。在默认 `pool` 模式下，来源组的会话和 Responses 别名会独立命名，避免不同来源共享缓存亲和；`single` 模式保留原有单个全局 Key 语义，不提供该隔离能力，多来源部署应使用 `pool`。
+
+通过已鉴权的 `POST /ctl/config` 热更新来源组。`groups` 字段是完整映射替换，组内遗漏的 `mode`、`priceBand.min` 或 `priceBand.max` 分别回退全局配置：
+
+```bash
+curl -X POST http://127.0.0.1:8787/ctl/config \
+  -H 'x-ui-password: <uiPassword>' \
+  -H 'content-type: application/json' \
+  -d '{"groups":{"budget":{"mode":"economy","priceBand":{"min":0,"max":0.05}},"premium":{"mode":"speed","priceBand":{"min":0.05,"max":0.12}}}}'
+```
+
+`GET /ctl/group-prices` 同样使用 `x-ui-password`，供 sub2api 轮询每个来源组的实时最低可用倍率：
+
+```json
+{
+  "at": 1760000000000,
+  "default": { "status": "ready", "lowestRate": 0.03, "groupId": 12 },
+  "groups": {
+    "budget": { "status": "ready", "lowestRate": 0.03, "groupId": 12 },
+    "premium": { "status": "unavailable", "lowestRate": null, "groupId": null }
+  }
+}
+```
+
+`ready` 表示该来源组当前有登录账号、可用分组和未熔断候选；`unauthenticated` 表示未登录或凭据失效，`stale` 表示实时统计无法取得，`unavailable` 表示当前区间内没有可路由候选。该接口只返回倍率和分组 ID，不返回托管 Key。
 
 ## Sentry 与用户反馈
 

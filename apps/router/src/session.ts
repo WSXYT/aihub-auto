@@ -113,13 +113,17 @@ export function requestRoutingContext(
 	headers: Headers,
 	body: ArrayBuffer | undefined,
 	resolveResponse: (responseId: string) => ResponseAffinity | undefined,
+	sourceGroup?: string,
 ): RequestRoutingContext {
 	const parsed = parseBody(body);
 	const model =
 		typeof parsed?.["model"] === "string" && parsed["model"].trim().length > 0
 			? parsed["model"].trim()
 			: undefined;
-	const namespace = model ?? "";
+	// 无来源头时保留既有 hash，已配置来源组时隔离它们的缓存亲和。
+	const namespace = sourceGroup
+		? `sub2api:${sourceGroup}:${model ?? ""}`
+		: (model ?? "");
 	const promptCacheKey = parsed
 		? stringId(parsed["prompt_cache_key"])
 		: undefined;
@@ -173,10 +177,9 @@ export function requestRoutingContext(
 
 	if (!prefix) return { model };
 	const api = path.includes("/responses") ? "responses" : "chat";
-	const serialized = JSON.stringify(canonical({ v: 1, api, ...prefix })).slice(
-		0,
-		MAX_FINGERPRINT_CHARS,
-	);
+	const serialized = JSON.stringify(
+		canonical({ v: 1, api, sourceGroup, ...prefix }),
+	).slice(0, MAX_FINGERPRINT_CHARS);
 	return { model, sessionKey: hashIdentity(serialized), cacheEvidence: true };
 }
 
@@ -185,8 +188,15 @@ export function requestSessionKey(
 	headers: Headers,
 	body: ArrayBuffer | undefined,
 	resolveResponse: (responseId: string) => ResponseAffinity | undefined,
+	sourceGroup?: string,
 ): string | undefined {
-	return requestRoutingContext(path, headers, body, resolveResponse).sessionKey;
+	return requestRoutingContext(
+		path,
+		headers,
+		body,
+		resolveResponse,
+		sourceGroup,
+	).sessionKey;
 }
 
 export function findResponseId(text: string): string | undefined {

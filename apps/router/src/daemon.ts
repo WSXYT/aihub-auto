@@ -1,4 +1,5 @@
 import {
+	AIHubApiError,
 	MODE_WEIGHTS,
 	type AIHubClient,
 	type CircuitBreaker,
@@ -58,10 +59,32 @@ export interface RouteRequest {
 	preferredGroupId?: number;
 	cacheEvidence?: boolean;
 	continuity?: boolean;
+	/** sub2api 来源组;选择其独立 mode/priceBand。 */
+	sourceGroup?: string;
 	/** false 表示并发旧请求只可自选备用组,不得覆盖更新的会话主绑定。 */
 	updateBinding?: boolean;
 	failedGroupIds?: readonly number[];
 }
+
+export type LowestPriceStatus =
+	| "ready"
+	| "unauthenticated"
+	| "unavailable"
+	| "stale";
+
+export interface LowestPrice {
+	status: LowestPriceStatus;
+	lowestRate: number | null;
+	groupId: number | null;
+}
+
+export interface LowestPrices {
+	at: number;
+	default: LowestPrice;
+	groups: Record<string, LowestPrice>;
+}
+
+type AccountDataStatus = "ready" | "unauthenticated" | "unavailable";
 
 /** 公开统计控制面 + 请求本地 P2C/Peak-EWMA 路由面。 */
 export class RouteDaemon {
@@ -123,8 +146,8 @@ export class RouteDaemon {
 		});
 	}
 
-	private async refreshAccountData(): Promise<void> {
-		if (!this.deps.credentials.accessToken) return;
+	private async refreshAccountData(): Promise<AccountDataStatus> {
+		if (!this.deps.credentials.accessToken) return "unauthenticated";
 		const [groups, rates] = await Promise.allSettled([
 			this.deps.client.getAvailableGroups(),
 			this.deps.client.getUserGroupRates(),
@@ -136,6 +159,85 @@ export class RouteDaemon {
 				.filter((id) => Number.isInteger(id) && id > 0);
 		}
 		if (rates.status === "fulfilled") this.userRates = rates.value;
+		if (groups.status === "fulfilled" && rates.status === "fulfilled") {
+			return "ready";
+		}
+		return [groups, rates].some(
+			(result) =>
+				result.status === "rejected" &&
+				result.reason instanceof AIHubApiError &&
+				result.reason.status === 401,
+		)
+			? "unauthenticated"
+			: "unavailable";
+	}
+
+	private sourcePolicy(
+		sourceGroup?: string,
+	): Pick<ScoringOptions, "mode" | "priceBand"> {
+		const config = this.deps.config;
+		const policy = sourceGroup ? config.groups[sourceGroup] : undefined;
+		return {
+			mode: policy?.mode ?? config.mode,
+			priceBand: { ...config.priceBand, ...policy?.priceBand },
+		};
+	}
+
+	async lowestPrices(): Promise<LowestPrices> {
+		const at = Date.now();
+		const sourceGroups = Object.keys(this.deps.config.groups);
+		const unavailable = (
+			status: Exclude<LowestPriceStatus, "ready">,
+		): LowestPrice => ({ status, lowestRate: null, groupId: null });
+		const unavailableSnapshot = (
+			status: Exclude<LowestPriceStatus, "ready">,
+		): LowestPrices => ({
+			at,
+			default: unavailable(status),
+			groups: Object.fromEntries(
+				sourceGroups.map((group) => [group, unavailable(status)]),
+			),
+		});
+		if (!this.deps.credentials.accessToken || this.needsReauth) {
+			return unavailableSnapshot("unauthenticated");
+		}
+
+		const [{ items, stale }, accountData] = await Promise.all([
+			this.fetchStats("openai"),
+			this.refreshAccountData(),
+		]);
+		if (accountData !== "ready") return unavailableSnapshot(accountData);
+		if (stale) return unavailableSnapshot("stale");
+
+		const priceFor = (sourceGroup?: string): LowestPrice => {
+			const evaluation = this.evaluate(items, at, [], false, sourceGroup);
+			const candidate = [...evaluation.eligible, ...evaluation.standby].reduce<
+				ScoredCandidate | undefined
+			>(
+				(best, current) =>
+					!best ||
+					current.effectiveRate < best.effectiveRate ||
+					(current.effectiveRate === best.effectiveRate &&
+						current.stat.groupId < best.stat.groupId)
+						? current
+						: best,
+				undefined,
+			);
+			return candidate
+				? {
+						status: "ready",
+						lowestRate: candidate.effectiveRate,
+						groupId: candidate.stat.groupId,
+					}
+				: unavailable("unavailable");
+		};
+		return {
+			at,
+			default: priceFor(),
+			groups: Object.fromEntries(
+				sourceGroups.map((group) => [group, priceFor(group)]),
+			),
+		};
 	}
 
 	private breakerGroupIds(now: number, allowHalfOpen: boolean): number[] {
@@ -154,11 +256,13 @@ export class RouteDaemon {
 		now: number,
 		extraBlacklist: readonly number[] = [],
 		allowHalfOpen = false,
+		sourceGroup?: string,
 	): ScoringOptions {
 		const config = this.deps.config;
+		const policy = this.sourcePolicy(sourceGroup);
 		return {
-			mode: config.mode,
-			priceBand: config.priceBand,
+			mode: policy.mode,
+			priceBand: policy.priceBand,
 			blacklist: [...config.blacklist, ...extraBlacklist],
 			circuitOpenGroupIds: this.breakerGroupIds(now, allowHalfOpen),
 			economyPolicy: config.economyPolicy,
@@ -174,10 +278,17 @@ export class RouteDaemon {
 		now: number,
 		extraBlacklist: readonly number[] = [],
 		allowHalfOpen = false,
+		sourceGroup?: string,
 	): Evaluation {
 		return evaluate(
 			items,
-			this.scoringOptions("openai", now, extraBlacklist, allowHalfOpen),
+			this.scoringOptions(
+				"openai",
+				now,
+				extraBlacklist,
+				allowHalfOpen,
+				sourceGroup,
+			),
 			this.deps.observations.asMap(now),
 			this.userRates,
 		);
@@ -198,6 +309,9 @@ export class RouteDaemon {
 			"invalid_latency",
 			"local_error_rate",
 		]);
+		if (Object.keys(this.deps.config.groups).length > 0) {
+			forceReasons.delete("price_band");
+		}
 		const groupIds = new Set(
 			evaluation.excluded
 				.filter((candidate) => forceReasons.has(candidate.excludeReason))
@@ -465,7 +579,13 @@ export class RouteDaemon {
 		if (
 			lockedGroupId !== null &&
 			!blocked.has(lockedGroupId) &&
-			this.hardEligible(lockedGroupId, items, blocked, now) &&
+			this.hardEligible(
+				lockedGroupId,
+				items,
+				blocked,
+				now,
+				request.sourceGroup,
+			) &&
 			this.deps.breaker.allowRequest(lockedGroupId, now)
 		) {
 			if (current?.groupId === lockedGroupId) return current;
@@ -478,14 +598,26 @@ export class RouteDaemon {
 		}
 		if (
 			current &&
-			this.hardEligible(current.groupId, items, blocked, now) &&
+			this.hardEligible(
+				current.groupId,
+				items,
+				blocked,
+				now,
+				request.sourceGroup,
+			) &&
 			this.deps.breaker.allowRequest(current.groupId, now)
 		) {
 			return current;
 		}
 
 		for (;;) {
-			const evaluation = this.evaluate(items, now, [...blocked], true);
+			const evaluation = this.evaluate(
+				items,
+				now,
+				[...blocked],
+				true,
+				request.sourceGroup,
+			);
 			const target = evaluation.eligible.find((candidate) =>
 				Number.isFinite(candidate.score),
 			);
@@ -530,7 +662,13 @@ export class RouteDaemon {
 		if (
 			preserveBinding &&
 			affinityGroupId !== undefined &&
-			this.hardEligible(affinityGroupId, items, failed, now) &&
+			this.hardEligible(
+				affinityGroupId,
+				items,
+				failed,
+				now,
+				request.sourceGroup,
+			) &&
 			this.deps.breaker.allowRequest(affinityGroupId, now)
 		) {
 			return this.prepareRequestKey(
@@ -545,7 +683,13 @@ export class RouteDaemon {
 		if (
 			lockedGroupId !== null &&
 			!failed.has(lockedGroupId) &&
-			this.hardEligible(lockedGroupId, items, failed, now) &&
+			this.hardEligible(
+				lockedGroupId,
+				items,
+				failed,
+				now,
+				request.sourceGroup,
+			) &&
 			this.deps.breaker.allowRequest(lockedGroupId, now)
 		) {
 			return this.prepareRequestKey(
@@ -557,15 +701,31 @@ export class RouteDaemon {
 		}
 
 		const blocked = new Set(failed);
-		const probe = this.halfOpenProbe(items, blocked, now, request.sessionKey);
+		const probe = this.halfOpenProbe(
+			items,
+			blocked,
+			now,
+			request.sessionKey,
+			request.sourceGroup,
+		);
 		if (probe !== undefined && this.deps.breaker.allowRequest(probe, now)) {
 			return this.prepareRequestKey(probe, request, previousGroupId, now);
 		}
 
 		let target: ScoredCandidate | undefined;
 		for (;;) {
-			const evaluation = this.evaluate(items, now, [...blocked]);
-			target = this.selectP2c(evaluation, request.sessionKey ?? randomUUID());
+			const evaluation = this.evaluate(
+				items,
+				now,
+				[...blocked],
+				false,
+				request.sourceGroup,
+			);
+			target = this.selectP2c(
+				evaluation,
+				request.sessionKey ?? randomUUID(),
+				this.sourcePolicy(request.sourceGroup).mode,
+			);
 			if (!target) break;
 			if (this.deps.breaker.allowRequest(target.stat.groupId, now)) break;
 			blocked.add(target.stat.groupId);
@@ -576,7 +736,13 @@ export class RouteDaemon {
 			const fallback = this.deps.state.currentGroupId;
 			if (
 				fallback === undefined ||
-				!this.hardEligible(fallback, items, blocked, now) ||
+				!this.hardEligible(
+					fallback,
+					items,
+					blocked,
+					now,
+					request.sourceGroup,
+				) ||
 				!this.deps.breaker.allowRequest(fallback, now)
 			) {
 				return undefined;
@@ -597,6 +763,7 @@ export class RouteDaemon {
 		items: readonly GroupStat[],
 		blocked: ReadonlySet<number>,
 		now: number,
+		sourceGroup?: string,
 		probe = false,
 	): boolean {
 		const observations = this.deps.observations.asMap(now);
@@ -614,7 +781,7 @@ export class RouteDaemon {
 		return evaluate(
 			[...items],
 			{
-				...this.scoringOptions("openai", now, [...blocked], true),
+				...this.scoringOptions("openai", now, [...blocked], true, sourceGroup),
 				mode: "balanced",
 			},
 			observations,
@@ -689,6 +856,7 @@ export class RouteDaemon {
 	private selectP2c(
 		evaluation: Evaluation,
 		seed: string,
+		mode = this.deps.config.mode,
 	): ScoredCandidate | undefined {
 		// 请求调度使用显式池上限,不复用 Koishi 展示用的 scoreWindow。
 		// 否则健康容量会在负载计算前被永久排除。
@@ -707,7 +875,7 @@ export class RouteDaemon {
 			);
 		const second = candidates[secondIndex]!;
 		const active = this.deps.traffic.snapshot().activeByGroup ?? {};
-		const { latencyWeight } = MODE_WEIGHTS[this.deps.config.mode];
+		const { latencyWeight } = MODE_WEIGHTS[mode];
 		const adjustedScore = (candidate: ScoredCandidate): number => {
 			const pending = active[String(candidate.stat.groupId)] ?? 0;
 			// 静态评分与负载评分共享同一对数效用:
@@ -727,6 +895,7 @@ export class RouteDaemon {
 		blocked: ReadonlySet<number>,
 		now: number,
 		seed: string = randomUUID(),
+		sourceGroup?: string,
 	): number | undefined {
 		const candidates = this.deps.breaker
 			.snapshot(now)
@@ -734,7 +903,14 @@ export class RouteDaemon {
 				(entry) =>
 					entry.state === "half-open" &&
 					!blocked.has(entry.groupId) &&
-					this.hardEligible(entry.groupId, items, blocked, now, true),
+					this.hardEligible(
+						entry.groupId,
+						items,
+						blocked,
+						now,
+						sourceGroup,
+						true,
+					),
 			)
 			.sort(
 				(left, right) =>
