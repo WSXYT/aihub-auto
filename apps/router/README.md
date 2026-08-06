@@ -17,6 +17,40 @@ export OPENAI_API_KEY="anything"          # 本地代理自动注入真实 Key,�
 
 之后一切照旧——代理在幕后持续选择最优分组。
 
+## CC Switch 余额查询
+
+公网实例在 CC Switch 的 Codex 供应商中填写：
+
+```text
+Base URL: http://111.228.17.120:10001/v1
+API Key:  router config.json 中的 proxyToken
+```
+
+这里的 API Key 是中转入口口令，不是控制台 `uiPassword`，也不是 AIHub 原始 Key。控制台的“连接参数”可在输入 `uiPassword` 后点击小眼睛临时查看 `proxyToken`，明文会在 10 秒后自动隐藏。
+
+在该供应商的“用量查询”中启用自定义模板。查询专用 Base URL 和 API Key 留空以复用供应商配置，并使用：
+
+```javascript
+({
+  request: {
+    url: "{{baseUrl}}/usage",
+    method: "GET",
+    headers: { "Authorization": "Bearer {{apiKey}}" }
+  },
+  extractor: function(response) {
+    const remaining = response?.remaining ?? response?.quota?.remaining ?? response?.balance;
+    const unit = response?.unit ?? response?.quota?.unit ?? "USD";
+    return {
+      isValid: response?.is_active ?? response?.isValid ?? true,
+      remaining,
+      unit
+    };
+  }
+})
+```
+
+供应商 Base URL 已包含 `/v1`，所以脚本必须请求 `{{baseUrl}}/usage`。写成 `{{baseUrl}}/v1/usage` 会得到不存在的 `/v1/v1/usage`。
+
 桌面用户可直接安装 Release 中的 Tauri 版本：桌面窗口内置本路由器作为 sidecar，启动健康检查通过后打开同一套控制台，关闭窗口后转入托盘。托盘可重新显示窗口、打开实时日志、检查签名更新或明确退出。大多数 Windows x64 用户使用 NSIS；`aihub-auto-desktop-windows-x64.zip` 是可解压直接运行的桌面版。macOS 使用对应架构的 DMG，Debian/Ubuntu x64 使用 `.deb`；`aihub-auto-headless-<platform>-<arch>.zip` 始终是无窗口 standalone 路由器，适合无界面环境和其他 Linux 发行版；控制台右上角会标记“无头路由器”。
 
 ## 策略
@@ -73,6 +107,8 @@ AIHUB_AUTO_PORT=9000 ./aihub-auto
 | `baseUrl` | `https://aihub.top` | 站点地址(usage-stats 是 aihub 自有接口,不兼容其他站) |
 | `publicOrigin` | 空 | 可信反向代理的完整 HTTP(S) origin,例如 `https://router.example.com`;不信任转发头 |
 | `sentryDsn` | `xytime/aihub` 公共 DSN | Sentry 错误与反馈项目;可用 `SENTRY_DSN` 覆盖,显式留空时 SDK 与反馈入口均不加载 |
+| `outboundProxyMode` | `none` | `none` 直连、`system` 读取进程的 `HTTPS_PROXY`/`HTTP_PROXY`、`custom` 使用页面填写的地址；可热更新 |
+| `outboundProxyUrl` | 空 | 自定义 HTTP(S) 代理地址；仅在 `custom` 模式使用，最长 512 字符 |
 | `upstreamUserAgent` | 空 | 模型代理请求的自定义 UA;空值沿用客户端 UA,可在控制台热更新 |
 | `listen.host` / `listen.port` | `127.0.0.1` / `8787` | 监听地址,可改 `0.0.0.0` |
 | `mode` | `balanced` | economy / balanced / speed |
@@ -90,6 +126,8 @@ AIHUB_AUTO_PORT=9000 ./aihub-auto
 | `decision.*` | 见 ALGORITHM.md | 粘性/缓存惩罚/空闲阈值/最短驻留 |
 | `auditLog` | false | JSONL 决策审计(含每轮全部候选得分) |
 | `logLevel` | `info` | `app.log` 最低日志级别:debug / info / warn / error |
+
+控制台“设置 → 出站代理”提供直连、系统代理和自定义代理三种模式。“测试连接”使用页面中尚未保存的值请求 AIHub 公共接口，最多等待 8 秒，并且不会自行保存或修改当前运行配置。失败结果只返回稳定的错误类别，不回显代理地址、认证信息、底层连接细节或上游响应正文。
 
 ## Sentry 与用户反馈
 

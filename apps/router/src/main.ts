@@ -13,11 +13,14 @@ import {
 	loadState,
 	SentryDsnSchema,
 	validateListenSecurity,
-	type AppConfig,
 } from "./config.ts";
 import { RouteDaemon } from "./daemon.ts";
 import { RouteExecutor } from "./executor.ts";
 import { AuditLog, CrashLog, Logger, RollingFileLog } from "./logger.ts";
+import {
+	createOutboundFetch,
+	probeAIHubConnectivity,
+} from "./outbound-proxy.ts";
 import type { ProxyDeps } from "./proxy.ts";
 import { createServer } from "./server.ts";
 import { SessionAffinity } from "./session.ts";
@@ -33,28 +36,6 @@ import {
 	initRouterSentry,
 	syncSentryUser,
 } from "./sentry.ts";
-
-function upstreamProxy(config: AppConfig): string | undefined {
-	if (config.outboundProxyMode === "custom") return config.outboundProxyUrl;
-	if (config.outboundProxyMode === "system") {
-		return (
-			process.env["HTTPS_PROXY"] ??
-			process.env["https_proxy"] ??
-			process.env["HTTP_PROXY"] ??
-			process.env["http_proxy"]
-		);
-	}
-	return undefined;
-}
-
-function upstreamFetch(config: AppConfig): typeof globalThis.fetch {
-	return ((input: Request | string | URL, init?: RequestInit) => {
-		const proxy = upstreamProxy(config);
-		return proxy
-			? Bun.fetch(input, { ...init, proxy } as RequestInit)
-			: Bun.fetch(input, init);
-	}) as typeof globalThis.fetch;
-}
 
 async function main(): Promise<void> {
 	const startup = parseStartupOptions(process.argv.slice(2), process.env);
@@ -136,7 +117,7 @@ async function main(): Promise<void> {
 		process.exit(1);
 	}
 
-	const fetchUpstream = upstreamFetch(config);
+	const fetchUpstream = createOutboundFetch(config);
 	const client = new AIHubClient({
 		baseUrl: config.baseUrl,
 		token: () => credentials.accessToken,
@@ -304,6 +285,8 @@ async function main(): Promise<void> {
 			sentryDsn,
 			desktopMode: process.env["AIHUB_AUTO_DESKTOP"] === "1",
 			syncSentryUser,
+			probeOutboundProxy: (settings) =>
+				probeAIHubConnectivity(settings, { baseUrl: config.baseUrl }),
 		});
 	} catch (err) {
 		logger.error(

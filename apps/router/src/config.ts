@@ -71,9 +71,12 @@ export const UpdateMirrorSchema = z
 	.url()
 	.refine(isHttpsUrl, "更新镜像必须是 HTTPS URL");
 
-const ProxyUrlSchema = z
+export const OutboundProxyModeSchema = z.enum(["none", "system", "custom"]);
+
+export const ProxyUrlSchema = z
 	.string()
 	.url()
+	.max(512)
 	.refine(
 		(value) => {
 			try {
@@ -85,6 +88,35 @@ const ProxyUrlSchema = z
 		},
 		"自定义代理必须是 HTTP(S) URL",
 	);
+
+const outboundProxyFields = {
+	outboundProxyMode: OutboundProxyModeSchema.default("none"),
+	outboundProxyUrl: z.union([z.literal(""), ProxyUrlSchema]).default(""),
+};
+
+function validateOutboundProxy(
+	config: {
+		outboundProxyMode: "none" | "system" | "custom";
+		outboundProxyUrl: string;
+	},
+	ctx: z.RefinementCtx,
+): void {
+	if (config.outboundProxyMode === "custom" && !config.outboundProxyUrl) {
+		ctx.addIssue({
+			code: z.ZodIssueCode.custom,
+			path: ["outboundProxyUrl"],
+			message: "自定义代理模式必须填写代理地址",
+		});
+	}
+}
+
+export const OutboundProxyConfigSchema = z
+	.object({
+		outboundProxyMode: OutboundProxyModeSchema,
+		outboundProxyUrl: z.union([z.literal(""), ProxyUrlSchema]),
+	})
+	.strict()
+	.superRefine(validateOutboundProxy);
 
 export const ConfigSchema = z
 	.object({
@@ -99,8 +131,7 @@ export const ConfigSchema = z
 	/** 桌面更新: GitHub 失败后依次尝试的 HTTPS latest.json 镜像。 */
 	updateMirrors: z.array(UpdateMirrorSchema).max(3).default([]),
 	/** 出站代理: none 直连,system 使用进程继承的 HTTP(S)_PROXY,custom 使用下方地址。 */
-	outboundProxyMode: z.enum(["none", "system", "custom"]).default("none"),
-	outboundProxyUrl: z.union([z.literal(""), ProxyUrlSchema]).default(""),
+	...outboundProxyFields,
 	/** 模型代理请求的 User-Agent;空字符串表示沿用客户端值。 */
 	upstreamUserAgent: z
 		.string()
@@ -185,20 +216,12 @@ export const ConfigSchema = z
 	/** 非 loopback 监听时必须:反代 /v1 的 Bearer 口令 */
 	proxyToken: z.string().min(16).optional(),
 	/** 非 loopback 监听时必须:/ctl 控制台口令 */
-	uiPassword: z.string().min(12).optional(),
+	uiPassword: z.string().min(9).optional(),
 	/** JSONL 审计日志 */
 	auditLog: z.boolean().default(false),
 	logLevel: z.enum(["debug", "info", "warn", "error"]).default("info"),
 	})
-	.superRefine((config, ctx) => {
-		if (config.outboundProxyMode === "custom" && !config.outboundProxyUrl) {
-			ctx.addIssue({
-				code: z.ZodIssueCode.custom,
-				path: ["outboundProxyUrl"],
-				message: "自定义代理模式必须填写代理地址",
-			});
-		}
-	});
+	.superRefine(validateOutboundProxy);
 
 export type AppConfig = z.infer<typeof ConfigSchema>;
 
@@ -307,7 +330,7 @@ export function validateListenSecurity(config: AppConfig): string[] {
 		}
 		if (!config.uiPassword) {
 			problems.push(
-				`监听 ${config.listen.host} 时必须设置 uiPassword(≥12 字符)保护控制台`,
+				`监听 ${config.listen.host} 时必须设置 uiPassword(≥9 字符)保护控制台`,
 			);
 		}
 	}

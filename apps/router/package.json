@@ -1,6 +1,6 @@
 {
   "name": "@aihub-auto/router",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "private": true,
   "type": "module",
   "description": "AIHub session-affine auto-routing reverse proxy with an operations console",

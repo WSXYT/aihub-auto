@@ -1,13 +1,27 @@
 import { AIHubApiError, type AIHubClient, type ExcludeReason } from "@aihub-auto/core";
 import { join } from "node:path";
-import type { AppConfig, AppState, Credentials, FileStore } from "./config.ts";
-import { ConfigSchema } from "./config.ts";
+import {
+	ConfigSchema,
+	OutboundProxyConfigSchema,
+	type AppConfig,
+	type AppState,
+	type Credentials,
+	type FileStore,
+} from "./config.ts";
 import type { RouteDaemon } from "./daemon.ts";
 import type { RouteExecutor } from "./executor.ts";
-import { handleProxy, type ProxyDeps } from "./proxy.ts";
+import {
+	handleProxy,
+	proxyTokenAuthorized,
+	type ProxyDeps,
+} from "./proxy.ts";
 import { redact, type Logger } from "./logger.ts";
 import { captureRouterException } from "./sentry.ts";
 import { renderUi } from "./ui.ts";
+import {
+	OutboundProxyProbeError,
+	type OutboundProxySettings,
+} from "./outbound-proxy.ts";
 
 export interface ServerDeps {
 	config: AppConfig;
@@ -27,6 +41,9 @@ export interface ServerDeps {
 	/** 由 Tauri desktop sidecar 启动;否则为 standalone 无头路由器。 */
 	desktopMode: boolean;
 	syncSentryUser: (email?: string) => void;
+	probeOutboundProxy: (
+		settings: OutboundProxySettings,
+	) => Promise<{ latencyMs: number }>;
 }
 
 function json(body: unknown, status = 200): Response {
@@ -48,6 +65,36 @@ function accountBalance(profile: Record<string, unknown>): number | null {
 				? Number(value)
 				: NaN;
 	return Number.isFinite(balance) ? balance : null;
+}
+
+async function handleUsage(req: Request, deps: ServerDeps): Promise<Response> {
+	if (req.method !== "GET") {
+		const response = json({ error: "仅支持 GET" }, 405);
+		response.headers.set("Allow", "GET");
+		return response;
+	}
+	if (!proxyTokenAuthorized(req, deps.config.proxyToken)) {
+		return json({ error: "代理口令错误" }, 401);
+	}
+	if (!deps.credentials.accessToken) {
+		return json({ error: "尚未登录 AIHub" }, 503);
+	}
+	try {
+		const profile = await deps.client.me();
+		const balance = accountBalance(profile);
+		if (balance === null) return json({ error: "AIHub 余额格式无效" }, 502);
+		return json({
+			is_active: true,
+			remaining: balance,
+			balance,
+			unit: "USD",
+		});
+	} catch (error) {
+		if (error instanceof AIHubApiError && error.status === 401) {
+			return json({ error: "AIHub 登录已失效" }, 401);
+		}
+		return json({ error: "读取 AIHub 账户余额失败" }, 502);
+	}
 }
 
 function sentryOrigin(dsn: string): string | undefined {
@@ -185,6 +232,54 @@ export async function handleControl(
 				{ error: "读取 AIHub 账户信息失败" },
 				error instanceof AIHubApiError && error.status === 401 ? 401 : 502,
 			);
+		}
+	}
+
+	if (path === "/ctl/proxy-token" && req.method === "GET") {
+		return json({ proxyToken: deps.config.proxyToken ?? null });
+	}
+
+	if (path === "/ctl/outbound-proxy/test" && req.method === "POST") {
+		let body: unknown;
+		try {
+			body = await req.json();
+		} catch {
+			return json({ error: "非法 JSON" }, 400);
+		}
+		const parsed = OutboundProxyConfigSchema.safeParse(body);
+		if (!parsed.success) {
+			return json(
+				{
+					error: `代理配置校验失败: ${parsed.error.issues
+						.map((issue) => issue.message)
+						.join("; ")}`,
+				},
+				400,
+			);
+		}
+		try {
+			const result = await deps.probeOutboundProxy(parsed.data);
+			return json({
+				ok: true,
+				latencyMs: Math.max(0, Math.round(result.latencyMs)),
+			});
+		} catch (error) {
+			if (!(error instanceof OutboundProxyProbeError)) {
+				return json({ error: "无法通过该代理连接 AIHub" }, 502);
+			}
+			if (error.kind === "missing_system_proxy") {
+				return json({ error: "未检测到 HTTPS_PROXY 或 HTTP_PROXY" }, 400);
+			}
+			if (error.kind === "timeout") {
+				return json({ error: "AIHub 连接超时" }, 504);
+			}
+			if (error.kind === "upstream") {
+				return json(
+					{ error: `AIHub 返回 HTTP ${error.upstreamStatus ?? 502}` },
+					502,
+				);
+			}
+			return json({ error: "无法通过该代理连接 AIHub" }, 502);
 		}
 	}
 
@@ -689,6 +784,9 @@ export function createServer(deps: ServerDeps): ReturnType<typeof Bun.serve> {
 					},
 					req.method === "GET" || req.method === "HEAD" ? 200 : 404,
 				);
+			}
+			if (path === "/v1/usage") {
+				return handleUsage(req, deps);
 			}
 			// 其余全部按上游 API 反代
 			return handleProxy(req, deps.proxyDeps);

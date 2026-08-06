@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { CircuitBreaker, LocalObservationStore } from "@aihub-auto/core";
+import { OutboundProxyProbeError } from "../src/outbound-proxy.ts";
 import { handleProxy } from "../src/proxy.ts";
 import { browserRequestProblem } from "../src/server.ts";
 import { createHarness, type Harness } from "./harness.ts";
@@ -15,6 +16,85 @@ function proxyReq(): Request {
 		body: "{}",
 	});
 }
+
+describe("出站代理连通性控制", () => {
+	test("测试未保存的严格候选配置且不修改当前配置", async () => {
+		let seen: unknown;
+		h = createHarness({
+			withServer: true,
+			probeOutboundProxy: async (settings) => {
+				seen = settings;
+				return { latencyMs: 42.4 };
+			},
+		});
+		const before = {
+			mode: h.config.outboundProxyMode,
+			url: h.config.outboundProxyUrl,
+		};
+		const response = await fetch(`${h.serverUrl}/ctl/outbound-proxy/test`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				outboundProxyMode: "custom",
+				outboundProxyUrl: "http://127.0.0.1:7890",
+			}),
+		});
+		expect(response.status).toBe(200);
+		expect(response.headers.get("cache-control")).toBe("no-store");
+		expect(await response.json()).toEqual({ ok: true, latencyMs: 42 });
+		expect(seen).toEqual({
+			outboundProxyMode: "custom",
+			outboundProxyUrl: "http://127.0.0.1:7890",
+		});
+		expect(h.config.outboundProxyMode).toBe(before.mode);
+		expect(h.config.outboundProxyUrl).toBe(before.url);
+
+		for (const body of [
+			{ outboundProxyMode: "custom", outboundProxyUrl: "" },
+			{ outboundProxyMode: "none", outboundProxyUrl: "", extra: true },
+		]) {
+			const invalid = await fetch(`${h.serverUrl}/ctl/outbound-proxy/test`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			expect(invalid.status).toBe(400);
+		}
+	});
+
+	test("要求控制台口令并映射脱敏探测错误", async () => {
+		let failure: Error = new OutboundProxyProbeError("timeout");
+		h = createHarness({
+			withServer: true,
+			configPatch: { uiPassword: "console-pass-123" },
+			probeOutboundProxy: async () => {
+				throw failure;
+			},
+		});
+		const request = (headers?: Record<string, string>) =>
+			fetch(`${h.serverUrl}/ctl/outbound-proxy/test`, {
+				method: "POST",
+				headers: { "Content-Type": "application/json", ...headers },
+				body: JSON.stringify({
+					outboundProxyMode: "none",
+					outboundProxyUrl: "",
+				}),
+			});
+		expect((await request()).status).toBe(401);
+		const authorized = { "x-ui-password": "console-pass-123" };
+		for (const [error, status, message] of [
+			[new OutboundProxyProbeError("missing_system_proxy"), 400, "未检测到 HTTPS_PROXY 或 HTTP_PROXY"],
+			[new OutboundProxyProbeError("timeout"), 504, "AIHub 连接超时"],
+			[new OutboundProxyProbeError("upstream", 503), 502, "AIHub 返回 HTTP 503"],
+			[new Error("http://user:secret@proxy private socket detail"), 502, "无法通过该代理连接 AIHub"],
+		] as const) {
+			failure = error;
+			const response = await request(authorized);
+			expect(response.status).toBe(status);
+			expect(await response.json()).toEqual({ error: message });
+		}
+	});
+});
 
 describe("守护循环", () => {
 	test("冷启动:选最优组并执行(pool 建 Key)", async () => {
@@ -688,6 +768,12 @@ describe("控制台 API", () => {
 		expect(ui).toContain("/ctl/account");
 		expect(ui).toContain("outboundProxyMode");
 		expect(ui).toContain("saveOutboundProxy");
+		expect(ui).toContain('id="testOutboundProxy"');
+		expect(ui).toContain('id="outboundProxyTestResult"');
+		expect(ui).toContain('role="status" aria-live="polite"');
+		expect(ui).toContain("async function testOutboundProxy");
+		expect(ui).toContain("outboundProxyDirty");
+		expect(ui).toContain("/ctl/outbound-proxy/test");
 		expect(ui).toContain("autostart_enabled");
 		expect(ui).toContain("set_autostart");
 		expect(ui).toContain(
@@ -824,14 +910,82 @@ describe("控制台 API", () => {
 		expect(h.credentials.email).toBe("mock@test.local");
 	});
 
+	test("CC Switch usage endpoint requires proxy auth and returns balance", async () => {
+		h = createHarness({
+			withServer: true,
+			configPatch: { proxyToken: "proxy-token-123456" },
+		});
+		const base = h.serverUrl!;
+
+		const missing = await fetch(`${base}/v1/usage`);
+		expect(missing.status).toBe(401);
+		expect(await missing.json()).toMatchObject({ error: "代理口令错误" });
+
+		const wrong = await fetch(`${base}/v1/usage`, {
+			headers: { Authorization: "Bearer wrong-token" },
+		});
+		expect(wrong.status).toBe(401);
+
+		const bearer = await fetch(`${base}/v1/usage`, {
+			headers: { Authorization: "Bearer proxy-token-123456" },
+		});
+		expect(bearer.status).toBe(200);
+		expect(bearer.headers.get("cache-control")).toBe("no-store");
+		expect(await bearer.json()).toEqual({
+			is_active: true,
+			remaining: 12.34,
+			balance: 12.34,
+			unit: "USD",
+		});
+
+		const apiKey = await fetch(`${base}/v1/usage`, {
+			headers: { "x-api-key": "proxy-token-123456" },
+		});
+		expect(apiKey.status).toBe(200);
+		expect(
+			h.mock.requestLog.filter((entry) => entry.path === "/v1/usage"),
+		).toHaveLength(0);
+
+		const method = await fetch(`${base}/v1/usage`, {
+			method: "POST",
+			headers: { Authorization: "Bearer proxy-token-123456" },
+		});
+		expect(method.status).toBe(405);
+		expect(method.headers.get("allow")).toBe("GET");
+	});
+
+	test("CC Switch usage endpoint distinguishes AIHub login failures", async () => {
+		h = createHarness({
+			withServer: true,
+			configPatch: { proxyToken: "proxy-token-123456" },
+		});
+		const headers = { Authorization: "Bearer proxy-token-123456" };
+		const base = h.serverUrl!;
+
+		h.credentials.accessToken = undefined;
+		const loggedOut = await fetch(`${base}/v1/usage`, { headers });
+		expect(loggedOut.status).toBe(503);
+		expect(await loggedOut.json()).toEqual({ error: "尚未登录 AIHub" });
+
+		h.credentials.accessToken = "expired-token";
+		h.mock.expireToken = true;
+		const expired = await fetch(`${base}/v1/usage`, { headers });
+		expect(expired.status).toBe(401);
+		expect(await expired.json()).toEqual({ error: "AIHub 登录已失效" });
+	});
+
 	test("uiPassword 配置后:无口令 401,带口令通过;/healthz 与 /ui 开放", async () => {
 		h = createHarness({
 			withServer: true,
-			configPatch: { uiPassword: "console-pass-123" },
+			configPatch: {
+				uiPassword: "console-pass-123",
+				proxyToken: "proxy-token-123456",
+			},
 		});
 		const base = h.serverUrl!;
 		expect((await fetch(`${base}/ctl/status`)).status).toBe(401);
 		expect((await fetch(`${base}/ctl/logs`)).status).toBe(401);
+		expect((await fetch(`${base}/ctl/proxy-token`)).status).toBe(401);
 		expect(
 			(
 				await fetch(`${base}/ctl/status`, {
@@ -839,6 +993,14 @@ describe("控制台 API", () => {
 				})
 			).status,
 		).toBe(200);
+		const proxyTokenResponse = await fetch(`${base}/ctl/proxy-token`, {
+			headers: { "x-ui-password": "console-pass-123" },
+		});
+		expect(proxyTokenResponse.status).toBe(200);
+		expect(proxyTokenResponse.headers.get("cache-control")).toBe("no-store");
+		expect(await proxyTokenResponse.json()).toEqual({
+			proxyToken: "proxy-token-123456",
+		});
 		h.credentials.accessToken = undefined;
 		h.credentials.email = "stale@example.com";
 		const anonymousStatus = (await fetch(`${base}/ctl/status`, {
@@ -879,6 +1041,12 @@ describe("控制台 API", () => {
 		);
 		expect(html).toContain("styleNonce:CSP_NONCE");
 		expect(html).not.toContain("sessionStorage");
+		expect(html).toContain('id="revealGuideKey"');
+		expect(html).toContain('id="revealSettingsKey"');
+		expect(html).toContain("function hideProxyToken");
+		expect(html).toContain("10_000");
+		expect(html).toContain("visibilitychange");
+		expect(html).not.toContain("proxy-token-123456");
 
 		const ctl = await fetch(`${base}/ctl/status`, {
 			headers: { "x-ui-password": "console-pass-123" },

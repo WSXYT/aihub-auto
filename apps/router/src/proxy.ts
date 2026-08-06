@@ -144,6 +144,16 @@ function errorResponse(status: number, message: string): Response {
 	);
 }
 
+export function proxyTokenAuthorized(
+	req: Request,
+	proxyToken?: string,
+): boolean {
+	if (!proxyToken) return true;
+	const auth = req.headers.get("authorization") ?? "";
+	const key = req.headers.get("x-api-key") ?? "";
+	return auth === `Bearer ${proxyToken}` || key === proxyToken;
+}
+
 function downstreamHeaders(source: Headers, groupId: number): Headers {
 	const headers = new Headers();
 	source.forEach((value, name) => {
@@ -385,13 +395,8 @@ async function handleProxyRequest(
 	const maxRetries = deps.maxRetries ?? 2;
 	const maxBuffer = deps.maxBufferBytes ?? 20 * 1024 * 1024;
 
-	if (deps.proxyToken) {
-		const auth = req.headers.get("authorization") ?? "";
-		const key = req.headers.get("x-api-key") ?? "";
-		if (auth !== `Bearer ${deps.proxyToken}` && key !== deps.proxyToken) {
-			return errorResponse(401, "代理口令错误");
-		}
-	}
+	if (!proxyTokenAuthorized(req, deps.proxyToken))
+		return errorResponse(401, "代理口令错误");
 
 	let body: ArrayBuffer | undefined;
 	let retriable = true;

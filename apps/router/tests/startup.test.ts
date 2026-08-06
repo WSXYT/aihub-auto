@@ -48,4 +48,14 @@ describe("startup options", () => {
 		expect(effective.listen.port).toBe(9123);
 		expect(loaded.listen.port).toBe(8123);
 	});
+
+	test("accepts the supported 9-character console password", () => {
+		expect(ConfigSchema.parse({ uiPassword: "Qazwsx01@" }).uiPassword).toBe(
+			"Qazwsx01@",
+		);
+	});
+
+	test("rejects console passwords shorter than 9 characters", () => {
+		expect(() => ConfigSchema.parse({ uiPassword: "12345678" })).toThrow();
+	});
 });
