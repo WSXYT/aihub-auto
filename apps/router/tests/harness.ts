@@ -46,6 +46,7 @@ export function createHarness(opts?: {
 	configPatch?: Partial<AppConfig>;
 	withServer?: boolean;
 	loggedIn?: boolean;
+	probeOutboundProxy?: ServerDeps["probeOutboundProxy"];
 }): Harness {
 	const mock = new MockAIHub();
 	const dir = mkdtempSync(join(tmpdir(), "aihub-auto-test-"));
@@ -175,6 +176,8 @@ export function createHarness(opts?: {
 			sentryDsn: config.sentryDsn,
 			desktopMode: false,
 			syncSentryUser: () => {},
+			probeOutboundProxy:
+				opts?.probeOutboundProxy ?? (async () => ({ latencyMs: 1 })),
 		};
 		config.listen.port = 0;
 		server = createServer(serverDeps);
